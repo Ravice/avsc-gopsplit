@@ -23,6 +23,7 @@ DISCARD_SHORT_GOPS = not '-no-discard' in argv
 REEVALUATE_DISCARD_GOPS = not '-no-reeval' in argv
 METRIC = 2 if '-mixed' in argv else 1 if '-imp' in argv else 0
 DEBUG = '-debug' in argv
+WRITE_CONFIG = not '-no-config' in argv
 
 # <----------HELPERS---------->
 
@@ -48,9 +49,9 @@ def debug(s: str):
 
 def merge_small(scenes: Iterator) -> Iterator:
 	global GOP_SIZE, frame_count
-	accumulated: int = 0
 	yield 0
 
+	accumulated: int = 0
 	for last, this in pairwise(scenes):
 		length:	int = this - last
 		if (accumulated + length) >= GOP_SIZE:
@@ -67,19 +68,19 @@ def merge_small(scenes: Iterator) -> Iterator:
 def generate_candidates(last: int, this: int, idrs: int, discarded_idrs: int, limit: int = 64) -> list:
 	global scores, GOP_SIZE, HIERARCHICAL_LEVELS
 	factor: float = 1 if '-exact' in argv else 1.122462
-	candidates: list = []
 
+	candidates: list = []
 	for k in reversed(range(HIERARCHICAL_LEVELS,6)):
-			#debug(f"searching between ({max(last, last + ((idrs-1)*GOP_SIZE) + idrs - discarded_idrs)}) and ({min(this, last + ((idrs+1)*GOP_SIZE) + idrs - discarded_idrs)})")
-			costs = sorted([
+			offset: int = last + idrs - discarded_idrs
+			costs: list[dict] = sorted((
 					score for score in scores[
-						max(last, last + ((idrs-1)*GOP_SIZE) + idrs - discarded_idrs):
-						min(this, last + ((idrs+1)*GOP_SIZE) + idrs - discarded_idrs)
-					] if (score['frame'] - last - idrs + discarded_idrs) % (1<<k) == 0
-				],
-				key=lambda x: metric(x)
+						max(last, offset + ((idrs-1)*GOP_SIZE)):
+						min(this, offset + ((idrs+1)*GOP_SIZE))
+					] if (score['frame'] - offset) % (1<<k) == 0
+				), key=metric
 			)
-			if candidates == []: 
+
+			if candidates == []:
 				candidates = costs[:limit]
 			else:
 				for c in range(len(candidates)):
@@ -89,7 +90,7 @@ def generate_candidates(last: int, this: int, idrs: int, discarded_idrs: int, li
 	return candidates
 
 
-def split_large(scenes: Iterator) -> Iterator:
+def split_large(scenes: Iterator, minimum_size: int = GOP_SIZE//2) -> Iterator:
 	global DISCARD_SHORT_GOPS, REEVALUATE_DISCARD_GOPS, GOP_SIZE
 	lastkey: int = 0
 	yield 0
@@ -114,13 +115,12 @@ def split_large(scenes: Iterator) -> Iterator:
 				continue
 			
 			if all(discard := [
-				candidate["frame"] - lastkey < GOP_SIZE//2 or this - candidate["frame"] < GOP_SIZE//2
+				candidate["frame"] - lastkey < minimum_size or this - candidate["frame"] < minimum_size
 				for candidate in candidates
 			]):
 				discarded_idrs += 1
 				discarded_frms += GOP_SIZE if REEVALUATE_DISCARD_GOPS else 0
 				debug(f"[{this}] all candidates discarded -> {discarded_frms}")
-				#debug([c["frame"] for c in candidates])
 			else:
 				for c, candidate in enumerate(candidates):
 					if discard[c]: continue
@@ -132,8 +132,7 @@ def split_large(scenes: Iterator) -> Iterator:
 # <----------MAIN---------->
 
 avsc = {}
-with open(argv[1]) as f:
-	avsc = json.load(f)
+with open(argv[1]) as f: avsc = json.load(f)
 frame_count	= avsc["frame_count"]
 debug(f"frame count: {frame_count}")
 avsc_scenes	= avsc["scene_changes"]
@@ -145,15 +144,12 @@ for i in range(frame_count):
 		score["frame"] = i
 		scores.append(score)
 
-#print(avsc_scenes)
-#print(list(pairwise(avsc_scenes)))
-#print(list(merge_small(avsc_scenes)))
-
 keyframes = list(split_large(merge_small(avsc_scenes)))
 key_str = f"ForceKeyFrames : {'f,'.join(str(i) for i in keyframes)}f"
-svt_config: Path = Path(argv[1]).with_suffix('.conf')
-#with open(svt_config, 'w') as f:
-#	f.write(key_str)
+
+if WRITE_CONFIG:
+	svt_config: Path = Path(argv[1]).with_suffix('.conf')
+	with open(svt_config, 'w') as f: f.write(key_str)
 print (key_str)
 
 lengths = list(x[1] - (x[0]+1) for x in zip([0]+keyframes, keyframes+[frame_count]))[1:]
