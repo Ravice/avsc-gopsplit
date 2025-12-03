@@ -6,55 +6,61 @@
 import	json
 from	contextlib	import suppress
 from	statistics	import mean, median
-from	sys			import argv
+from	sys			import argv, stderr
 from	pathlib		import Path
 from	itertools	import tee
 from	collections.abc import Iterator
 
 # <----------GLOBALS---------->
 
+# Dirty CLI
 GOP_SIZE = 512
 for x in argv:
 	if '-g' in x[:2]:
 		GOP_SIZE = int(x[2:])
 
-HIERARCHICAL_LEVELS = 4 if '-strict' in argv else 0
 DISCARD_SHORT_GOPS = not '-no-discard' in argv
 REEVALUATE_DISCARD_GOPS = not '-no-reeval' in argv
 METRIC = 2 if '-mixed' in argv else 1 if '-imp' in argv else 0
-DEBUG = '-debug' in argv
+DEBUG = 2 if '-v-debug' in argv else 1 if '-debug' in argv else 0
 WRITE_CONFIG = not '-no-config' in argv
 
 # <----------HELPERS---------->
 
+def logb(x: int):
+	'quick minimum binary logarithm'
+	i = 0
+	while (x := x >> 1): i += 1;
+	return i
+
 def metric(x):
 	global METRIC
-	return [
-		x['inter_cost'],
-		x['imp_block_cost'],
-		x['imp_block_cost']*x['inter_cost']
-	][METRIC]
+	return x['inter_cost'] if METRIC == 0 \
+		else x['imp_block_cost'] if METRIC == 1 \
+		else x['imp_block_cost']*x['inter_cost']
 
 def pairwise(iterable):
-    "s -> (s0, s1), (s1, s2), (s2, s3), ..."
+    's -> (s0, s1), (s1, s2), (s2, s3), ...'
     a, b = tee(iterable)
     next(b, None)
     return zip(a, b)
 
-def debug(s: str):
+def debug(s: str, level: int = 0):
 	global DEBUG
-	if DEBUG: print(s)
+	if DEBUG > level:
+		print(s, file=stderr)
 
 # <----------ITERATORS---------->
 
-def merge_small(scenes: Iterator) -> Iterator:
-	global GOP_SIZE, frame_count
+def merge_small(scenes: Iterator, maximum: int = GOP_SIZE) -> Iterator:
+	'merges small scenes up to the requested gop size'
+	global frame_count
 	yield 0
 
 	accumulated: int = 0
 	for last, this in pairwise(scenes):
 		length:	int = this - last
-		if (accumulated + length) >= GOP_SIZE:
+		if (accumulated + length) >= maximum:
 			debug(f"[{this}] merged -> {accumulated}")
 			accumulated = 0
 			yield last
@@ -65,32 +71,30 @@ def merge_small(scenes: Iterator) -> Iterator:
 	yield frame_count
 
 
-def generate_candidates(last: int, this: int, idrs: int, discarded_idrs: int, limit: int = 64) -> list:
-	global scores, GOP_SIZE, HIERARCHICAL_LEVELS
+def generate_candidates(last: int, this: int, idrs: int, discarded_idrs: int) -> list:
+	'yields split candidates in order of score'
+	global scores, GOP_SIZE
+	
 	factor: float = 1 if '-exact' in argv else 1.122462
+	offset: int = last + idrs - discarded_idrs
 
-	candidates: list = []
-	for k in reversed(range(HIERARCHICAL_LEVELS,6)):
-			offset: int = last + idrs - discarded_idrs
-			costs: list[dict] = sorted((
-					score for score in scores[
-						max(last, offset + ((idrs-1)*GOP_SIZE)):
-						min(this, offset + ((idrs+1)*GOP_SIZE))
-					] if (score['frame'] - offset) % (1<<k) == 0
-				), key=metric
-			)
+	hierarchy = lambda x: \
+		5 if x%32 == 0	else \
+		4 if x%16 == 0	else \
+		3 if x%8 == 0	else \
+		2 if x%4 == 0	else \
+		1 if x%2 == 0	else 0
 
-			if candidates == []:
-				candidates = costs[:limit]
-			else:
-				for c in range(len(candidates)):
-					candidates[c] = costs[c] if metric(costs[c])*factor < metric(candidates[c]) else candidates[c]
-				factor *= factor
-
-	return candidates
+	return (candidate for candidate in reversed(sorted(
+		scores[
+			max(last, offset + ((idrs-1)*GOP_SIZE)):
+			min(this, offset + ((idrs+1)*GOP_SIZE))
+		],	key = lambda x: metric(x) * (factor ** hierarchy(x['frame']))
+	)))
 
 
 def split_large(scenes: Iterator, minimum_size: int = GOP_SIZE//2) -> Iterator:
+	'splits large gops into smaller ones'
 	global DISCARD_SHORT_GOPS, REEVALUATE_DISCARD_GOPS, GOP_SIZE
 	lastkey: int = 0
 	yield 0
@@ -110,24 +114,19 @@ def split_large(scenes: Iterator, minimum_size: int = GOP_SIZE//2) -> Iterator:
 		for j in range(1, required+1):
 			candidates = generate_candidates(last, this, j, discarded_idrs)
 			
-			if not DISCARD_SHORT_GOPS:
-				yield (lastkey := candidates[0]["frame"])
-				continue
-			
-			if all(discard := [
-				candidate["frame"] - lastkey < minimum_size or this - candidate["frame"] < minimum_size
-				for candidate in candidates
-			]):
+			if not DISCARD_SHORT_GOPS: yield next(candidates); continue
+
+			for c, candidate in enumerate(candidates):
+				if candidate["frame"] - lastkey >= minimum_size and this - candidate["frame"] >= minimum_size:
+					debug(f"[{this}] =>> {candidate['frame']} (C{c}:{metric(candidate):.0f})")
+					debug(f"{candidate['frame'] - lastkey} frames from key, {this - candidate['frame']} frames to key", 1)
+					discarded_frms = 0
+					yield (lastkey := candidate["frame"]); break
+			else:
 				discarded_idrs += 1
 				discarded_frms += GOP_SIZE if REEVALUATE_DISCARD_GOPS else 0
 				debug(f"[{this}] all candidates discarded -> {discarded_frms}")
-			else:
-				for c, candidate in enumerate(candidates):
-					if discard[c]: continue
-					debug(f"[{this}] =>> {candidate['frame']} (C{c}:{metric(candidate):.0f})")
-					discarded_frms = 0
-					yield (lastkey := candidate["frame"])
-					break
+
 
 # <----------MAIN---------->
 
