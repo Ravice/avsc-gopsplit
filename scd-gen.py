@@ -27,25 +27,25 @@ WRITE_CONFIG = not '-no-config' in argv
 
 # <----------HELPERS---------->
 
-def logb(x: int):
+def logb(x: int) -> int:
 	'quick minimum binary logarithm'
 	i = 0
 	while (x := x >> 1): i += 1;
 	return i
 
-def metric(x):
+def metric(x: dict) -> float:
 	global METRIC
 	return x['inter_cost'] if METRIC == 0 \
 		else x['imp_block_cost'] if METRIC == 1 \
 		else x['imp_block_cost']*x['inter_cost']
 
-def pairwise(iterable):
+def pairwise(iterable: Iterator) -> Iterator:
     's -> (s0, s1), (s1, s2), (s2, s3), ...'
     a, b = tee(iterable)
     next(b, None)
     return zip(a, b)
 
-def debug(s: str, level: int = 0):
+def debug(s: str, level: int = 0) -> None:
 	global DEBUG
 	if DEBUG > level:
 		print(s, file=stderr)
@@ -60,7 +60,7 @@ def merge_small(scenes: Iterator, maximum: int = GOP_SIZE) -> Iterator:
 	accumulated: int = 0
 	for last, this in pairwise(scenes):
 		length:	int = this - last
-		if (accumulated + length) >= maximum:
+		if (accumulated + length) > maximum:
 			debug(f"[{this}] merged -> {accumulated}")
 			accumulated = 0
 			yield last
@@ -71,11 +71,11 @@ def merge_small(scenes: Iterator, maximum: int = GOP_SIZE) -> Iterator:
 	yield frame_count
 
 
-def generate_candidates(last: int, this: int, idrs: int, discarded_idrs: int) -> list:
+def generate_candidates(last: int, this: int, idrs: int, discarded_idrs: int) -> Iterator:
 	'yields split candidates in order of score'
 	global scores, GOP_SIZE
 	
-	factor: float = 1 if '-exact' in argv else 1.122462
+	factor: float = 1 if '-exact' in argv else 1.2
 	offset: int = last + idrs - discarded_idrs
 
 	hierarchy = lambda x: \
@@ -87,38 +87,35 @@ def generate_candidates(last: int, this: int, idrs: int, discarded_idrs: int) ->
 
 	return (candidate for candidate in reversed(sorted(
 		scores[
-			max(last, offset + ((idrs-1)*GOP_SIZE)):
-			min(this, offset + ((idrs+1)*GOP_SIZE))
-		],	key = lambda x: metric(x) * (factor ** hierarchy(x['frame']))
+			offset + ((idrs-1)*GOP_SIZE):
+			offset + ((idrs+1)*GOP_SIZE)
+		],	key = lambda x: metric(x) * (factor ** hierarchy(x['frame'] - offset))
 	)))
 
 
-def split_large(scenes: Iterator, minimum_size: int = GOP_SIZE//2) -> Iterator:
+def split_large(scenes: Iterator, minimum: int = GOP_SIZE//(8 if '-short' in argv else 1)) -> Iterator:
 	'splits large gops into smaller ones'
 	global DISCARD_SHORT_GOPS, REEVALUATE_DISCARD_GOPS, GOP_SIZE
-	lastkey: int = 0
 	yield 0
 
+	lastkey: int = 0
 	for i, (last, this) in enumerate(pairwise(scenes)):
-		length: int = this - last
+		length:	int = this - last
 		required: int = length // GOP_SIZE
+
 		debug(f"------------\nSCENE {i} : [{last} -> {this}] length: {length} required: {required}")
+		if last: yield (lastkey := last)
 
 		discarded_idrs: int	= 0
 		discarded_frms: int	= 0
-
-		if last:
-			lastkey = last
-			yield last
-
 		for j in range(1, required+1):
 			candidates = generate_candidates(last, this, j, discarded_idrs)
 			
 			if not DISCARD_SHORT_GOPS: yield next(candidates); continue
 
 			for c, candidate in enumerate(candidates):
-				if candidate["frame"] - lastkey >= minimum_size and this - candidate["frame"] >= minimum_size:
-					debug(f"[{this}] =>> {candidate['frame']} (C{c}:{metric(candidate):.0f})")
+				if candidate["frame"] - lastkey >= minimum and this - candidate["frame"] >= minimum:
+					debug(f"[{last} -> {this}] =>> {candidate['frame']} (C{c}:{metric(candidate):.0f})")
 					debug(f"{candidate['frame'] - lastkey} frames from key, {this - candidate['frame']} frames to key", 1)
 					discarded_frms = 0
 					yield (lastkey := candidate["frame"]); break
@@ -130,11 +127,27 @@ def split_large(scenes: Iterator, minimum_size: int = GOP_SIZE//2) -> Iterator:
 
 # <----------MAIN---------->
 
+if len(argv) == 1 or '-h' in argv or '--help' in argv:
+	print(f"""usage: {argv[0]} PATH_TO_AVSC_JSON -args
+-------------------
+available arguments
+-------------------
+ -gX                 target gop size (default -g512)
+ -no-discard         will not discard short gops
+ -mixed / -imp       use important blocks (~rdo importance) to decide on idr
+ -debug / -v-debug   debug info, verbose debug + cost graph
+ -short              half allowed minimum distance to previous/next gop
+ -no-merge           do not merge short gops (bad if lots of ABA cutting back and forth)
+""")
+	exit(0)
+
 avsc = {}
 with open(argv[1]) as f: avsc = json.load(f)
+if avsc == {}: print("avsc json not loaded"); exit(1) 
+
 frame_count	= avsc["frame_count"]
-debug(f"frame count: {frame_count}")
 avsc_scenes	= avsc["scene_changes"]
+debug(avsc_scenes, 1)
 avsc_scenes.append(frame_count)
 scores = []
 for i in range(frame_count):
@@ -143,17 +156,31 @@ for i in range(frame_count):
 		score["frame"] = i
 		scores.append(score)
 
-keyframes = list(split_large(merge_small(avsc_scenes)))
+
+keyframes = list(split_large(avsc_scenes)) if '-no-merge' in argv else list(split_large(merge_small(avsc_scenes)))
 key_str = f"ForceKeyFrames : {'f,'.join(str(i) for i in keyframes)}f"
 
 if WRITE_CONFIG:
 	svt_config: Path = Path(argv[1]).with_suffix('.conf')
-	with open(svt_config, 'w') as f: f.write(key_str)
-print (key_str)
+	with open(svt_config, 'w') as f: 
+		f.write(key_str)
+		debug(f"written config -> {svt_config}")
 
 lengths = list(x[1] - (x[0]+1) for x in zip([0]+keyframes, keyframes+[frame_count]))[1:]
-print(lengths)
+print("============")
+print(f"Generated {len(keyframes)} scenes for {frame_count} frames (expected: {frame_count//GOP_SIZE})")
+print("============")
+print(key_str)
+print("------------")
+print(f"Scene Lengths: min: {min(lengths)}, mean: {mean(lengths):.0f}, target: {GOP_SIZE}, median: {median(lengths):.0f}, max: {max(lengths)}")
+print(f"{lengths}")
 
-print(f"{len(keyframes)} scenes")
-print(f"mean: {mean(lengths)}")
-print(f"median: {median(lengths)}")
+if DEBUG >= 2:
+	import matplotlib.pyplot as plt
+	frm = range(0, frame_count)
+	plt.plot(list(score['inter_cost'] for score in scores))
+	plt.plot(list(score['imp_block_cost'] for score in scores))
+	plt.plot(list(score['inter_cost']*score['imp_block_cost'] for score in scores))
+	plt.xticks(keyframes)
+	plt.yscale('log')
+	plt.show()
