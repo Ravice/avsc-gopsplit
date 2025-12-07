@@ -50,6 +50,14 @@ def debug(s: str, level: int = 0) -> None:
 	if DEBUG > level:
 		print(s, file=stderr)
 
+def ewma(values: Iterator, decay: float = 0.04) -> Iterator:
+	'exponentially weighted moving average'
+	last = None
+	for this in values:
+		if last == None: 
+			last = this
+		yield (last := (decay*this) + ((1-decay)*last))
+
 # <----------ITERATORS---------->
 
 def merge_small(scenes: Iterator, maximum: int = GOP_SIZE) -> Iterator:
@@ -57,15 +65,17 @@ def merge_small(scenes: Iterator, maximum: int = GOP_SIZE) -> Iterator:
 	global frame_count
 	yield 0
 
+	prev: int = 0
 	accumulated: int = 0
 	for last, this in pairwise(scenes):
 		length:	int = this - last
-		if (accumulated + length) > maximum:
+		if (accumulated + length) > maximum and last - prev > 8:
 			debug(f"[{this}] merged -> {accumulated}")
 			accumulated = 0
 			yield last
 		else:
 			accumulated += length
+			prev = last
 			debug(f"[{this}] accumulating -> {accumulated}")
 
 	yield frame_count
@@ -74,26 +84,32 @@ def merge_small(scenes: Iterator, maximum: int = GOP_SIZE) -> Iterator:
 def generate_candidates(last: int, this: int, idrs: int, discarded_idrs: int) -> Iterator:
 	'yields split candidates in order of score'
 	global scores, GOP_SIZE
-	
-	factor: float = 1 if '-exact' in argv else 1.2
 	offset: int = last + idrs - discarded_idrs
 
+	#bias to minimise mg fragmentation unless candidate is good enough
+	factor: float = 1 if '-exact' in argv else 1.2
 	hierarchy = lambda x: \
 		5 if x%32 == 0	else \
 		4 if x%16 == 0	else \
 		3 if x%8 == 0	else \
 		2 if x%4 == 0	else \
 		1 if x%2 == 0	else 0
+	
+	yield from reversed(
+		sorted(
+			filter(
+				lambda x: metric(x) > (metric_ewma[x['frame']] if '-ewma' in argv else 0),
+				scores[
+					offset + ((idrs-1)*GOP_SIZE):
+					offset + ((idrs+1)*GOP_SIZE)
+				]
+			),	
+			key = lambda x: metric(x) * (factor ** hierarchy(x['frame'] - offset))
+		)
+	)
 
-	return (candidate for candidate in reversed(sorted(
-		scores[
-			offset + ((idrs-1)*GOP_SIZE):
-			offset + ((idrs+1)*GOP_SIZE)
-		],	key = lambda x: metric(x) * (factor ** hierarchy(x['frame'] - offset))
-	)))
 
-
-def split_large(scenes: Iterator, minimum: int = GOP_SIZE//(8 if '-short' in argv else 1)) -> Iterator:
+def split_large(scenes: Iterator, minimum: int = GOP_SIZE//(2 if '-short' in argv else 1)) -> Iterator:
 	'splits large gops into smaller ones'
 	global DISCARD_SHORT_GOPS, REEVALUATE_DISCARD_GOPS, GOP_SIZE
 	yield 0
@@ -150,21 +166,23 @@ avsc_scenes	= avsc["scene_changes"]
 debug(avsc_scenes, 1)
 avsc_scenes.append(frame_count)
 scores = []
-for i in range(frame_count):
+for i in range(frame_count-1):
 	with suppress(KeyError): 
 		score = avsc["scores"][str(i)]
 		score["frame"] = i
 		scores.append(score)
+metric_ewma = list(ewma(metric(score) for score in scores)) + [0]
+rev_ewma = list(reversed(tuple(ewma(metric(score) for score in reversed(scores))))) + [0]
+metric_ewma = [(x + y)*0.5 for x, y in zip(metric_ewma, rev_ewma)]
 
-
-keyframes = list(split_large(avsc_scenes)) if '-no-merge' in argv else list(split_large(merge_small(avsc_scenes)))
+keyframes = list(split_large(merge_small(avsc_scenes, maximum=0 if '-no-merge' in argv else GOP_SIZE))) 
 key_str = f"ForceKeyFrames : {'f,'.join(str(i) for i in keyframes)}f"
 
 if WRITE_CONFIG:
 	svt_config: Path = Path(argv[1]).with_suffix('.conf')
 	with open(svt_config, 'w') as f: 
 		f.write(key_str)
-		debug(f"written config -> {svt_config}")
+		print(f"written config -> {svt_config}")
 
 lengths = list(x[1] - (x[0]+1) for x in zip([0]+keyframes, keyframes+[frame_count]))[1:]
 print("============")
@@ -178,9 +196,9 @@ print(f"{lengths}")
 if DEBUG >= 2:
 	import matplotlib.pyplot as plt
 	frm = range(0, frame_count)
-	plt.plot(list(score['inter_cost'] for score in scores))
 	plt.plot(list(score['imp_block_cost'] for score in scores))
-	plt.plot(list(score['inter_cost']*score['imp_block_cost'] for score in scores))
+	plt.plot(tuple(metric(score) for score in scores))
+	plt.plot(tuple(metric_ewma))
 	plt.xticks(keyframes)
 	plt.yscale('log')
 	plt.show()
